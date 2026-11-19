@@ -1,359 +1,282 @@
 // Cover Vice — editor wiring.
-//
-// Owns the document state (photos, panel assignments, crops, preset, size,
-// words), binds every control in index.html to it, and repaints the preview
-// through CoverEngine.drawCover — the same function the PNG export uses.
-// Photos are read from the user's machine into memory only; nothing is
-// uploaded anywhere (the app makes no network requests at all).
-//
-// URL-param screenshot mode (used by take-screenshots.mjs):
-//   ?shot=cover&size=square|portrait|wide&photo=pier|boulevard
-//     &preset=sunset|neon|gold&title=...&caption=...
-//       shows only the finished cover, drawn by the export code path.
-//   ?shot=editor&photo=boulevard&caption=...
-//       opens the editor with that sample spread across the panels.
-'use strict';
+// Loads photos (user files stay on this machine; the two bundled samples
+// ship with the app), keeps the cover state, and repaints the preview
+// through the same paintCover the export uses.
 
-const E = window.CoverEngine;
-const $ = (id) => document.getElementById(id);
+import {
+  COVER_PRESETS, COVER_SIZES, paintCover, panelsForSize,
+  pointInPolygon, renderCoverCanvas,
+} from './cover.js';
 
 const SAMPLES = [
-  { id: 'sample-pier', name: 'Pier at dusk', url: 'samples/pier.jpg' },
-  { id: 'sample-boulevard', name: 'Boulevard', url: 'samples/boulevard.jpg' },
-];
-
-// Deterministic per-panel crops used when one photo fills every panel, so
-// a single picture still reads as a collage of different moments.
-const SPREAD_CROPS = [
-  { ox: 0.0, oy: 0.0, zoom: 1.0 },
-  { ox: 0.35, oy: 0.1, zoom: 1.35 },
-  { ox: -0.3, oy: -0.05, zoom: 1.25 },
-  { ox: 0.15, oy: -0.25, zoom: 1.45 },
-  { ox: -0.2, oy: 0.2, zoom: 1.3 },
-  { ox: 0.25, oy: 0.25, zoom: 1.4 },
+  { id: 'pier', label: 'Pier at dusk', src: 'samples/pier.jpg' },
+  { id: 'boulevard', label: 'Boulevard', src: 'samples/boulevard.jpg' },
 ];
 
 const state = {
-  sizeId: 'square',
+  title: 'VICE CITY HEAT',
+  caption: 'One last score',
   presetId: 'sunset',
-  title: 'Cover Vice',
-  caption: 'One city. No brakes.',
-  mode: 'panels',
+  sizeId: 'square',
+  mode: 'sliced',
+  photos: [],
+  photoNames: [],
   panels: [],
-  sliced: { photoId: null, ox: 0, oy: 0, zoom: 1 },
+  sliced: { photo: 0, offX: 0, offY: 0, zoom: 1 },
   selected: 0,
 };
 
-const images = new Map(); // photoId -> HTMLImageElement
-const photoList = [];     // [{id, name}] in load order
-let photoSeq = 0;
-
-function sizeDims() { return E.SIZES[state.sizeId]; }
-
-function blankPanel() { return { photoId: null, ox: 0, oy: 0, zoom: 1 }; }
-
-// Keeps state.panels the same length as the current layout's panel count.
-function syncPanelCount() {
-  const n = E.panelPolygons(sizeDims().w, sizeDims().h).length;
-  while (state.panels.length < n) state.panels.push(blankPanel());
-  state.panels.length = n;
-  if (state.selected >= n) state.selected = 0;
-}
-
-function activeCrop() {
-  return state.mode === 'sliced' ? state.sliced : state.panels[state.selected];
-}
-
-// --- Photo loading --------------------------------------------------------
-function loadImageFromUrl(url) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = url;
-  });
-}
-
-async function addPhoto(id, name, url) {
-  if (!images.has(id)) {
-    images.set(id, await loadImageFromUrl(url));
-    photoList.push({ id, name });
-  }
-  renderTray();
-  return id;
-}
-
-async function addPhotoFile(file) {
-  const id = `file-${++photoSeq}`;
-  const url = URL.createObjectURL(file);
-  await addPhoto(id, file.name.replace(/\.[^.]+$/, ''), url);
-  return id;
-}
-
-// Spreads one photo across every panel with the deterministic crops.
-function spreadPhoto(photoId) {
-  state.panels = state.panels.map((_, i) => ({
-    photoId, ...(SPREAD_CROPS[i % SPREAD_CROPS.length]),
-  }));
-  state.sliced.photoId = photoId;
-}
-
-function assignToSelected(photoId) {
-  if (state.mode === 'sliced') {
-    state.sliced.photoId = photoId;
-  } else {
-    state.panels[state.selected].photoId = photoId;
-  }
-  redraw();
-}
-
-// --- Preview --------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
 const preview = $('preview');
 const pctx = preview.getContext('2d');
 
-function redraw() {
-  syncPanelCount();
-  const { w, h } = sizeDims();
-  if (preview.width !== w || preview.height !== h) {
-    preview.width = w;
-    preview.height = h;
+function freshPanel(photo) {
+  return { photo, offX: 0, offY: 0, zoom: 1 };
+}
+
+function ensurePanels() {
+  const count = panelsForSize(state.sizeId, 100, 100).length;
+  while (state.panels.length < count) {
+    state.panels.push(freshPanel(state.panels.length % Math.max(1, state.photos.length)));
   }
-  E.drawCover(pctx, w, h, state, images, {});
-  syncCropControls();
+}
+
+function activePlacement() {
+  return state.mode === 'sliced' ? state.sliced : state.panels[state.selected];
+}
+
+function drawPreview() {
+  const size = COVER_SIZES[state.sizeId];
+  preview.width = size.width;
+  preview.height = size.height;
+  paintCover(pctx, size.width, size.height, state);
+  if (state.mode === 'panels') {
+    // Outline the selected panel so it is clear which one edits apply to.
+    const poly = panelsForSize(state.sizeId, size.width, size.height)[state.selected];
+    if (poly) {
+      pctx.save();
+      pctx.beginPath();
+      poly.forEach(([x, y], i) => (i === 0 ? pctx.moveTo(x, y) : pctx.lineTo(x, y)));
+      pctx.closePath();
+      pctx.strokeStyle = '#ffe14d';
+      pctx.lineWidth = Math.max(5, size.width * 0.007);
+      pctx.setLineDash([size.width * 0.02, size.width * 0.012]);
+      pctx.stroke();
+      pctx.restore();
+    }
+  }
+}
+
+function syncControls() {
+  const place = activePlacement();
+  if (!place) return;
+  $('offX').value = place.offX;
+  $('offY').value = place.offY;
+  $('zoom').value = place.zoom;
+  $('photoPick').value = String(place.photo);
   $('panelLabel').textContent = state.mode === 'sliced'
-    ? 'Sliced photo — one image across all panels'
+    ? 'Sliced photo (all panels)'
     : `Panel ${state.selected + 1} of ${state.panels.length}`;
 }
 
-// Maps a pointer event to cover-design coordinates.
-function eventToDesign(ev) {
-  const r = preview.getBoundingClientRect();
-  const { w, h } = sizeDims();
-  return {
-    x: (ev.clientX - r.left) * (w / r.width),
-    y: (ev.clientY - r.top) * (h / r.height),
-    dx: ev.movementX * (w / r.width),
-    dy: ev.movementY * (h / r.height),
-  };
-}
-
-let dragging = false;
-preview.addEventListener('pointerdown', (ev) => {
-  const p = eventToDesign(ev);
-  if (state.mode === 'panels') {
-    const polys = E.panelPolygons(sizeDims().w, sizeDims().h);
-    const hit = polys.findIndex((poly) => E.pointInPolygon(p.x, p.y, poly));
-    if (hit >= 0) state.selected = hit;
-  }
-  dragging = true;
-  preview.setPointerCapture(ev.pointerId);
-  redraw();
-});
-preview.addEventListener('pointermove', (ev) => {
-  if (!dragging) return;
-  const p = eventToDesign(ev);
-  const crop = activeCrop();
-  const { w, h } = sizeDims();
-  const box = state.mode === 'sliced'
-    ? { w, h }
-    : E.polygonBounds(E.panelPolygons(w, h)[state.selected]);
-  crop.ox = clamp(crop.ox + p.dx / (box.w * 0.6), -1, 1);
-  crop.oy = clamp(crop.oy + p.dy / (box.h * 0.6), -1, 1);
-  redraw();
-});
-preview.addEventListener('pointerup', () => { dragging = false; });
-
-function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
-
-// Keyboard fine-tuning: arrow keys nudge the active crop by a small step
-// (Shift = bigger step), Delete clears the selected panel's photo.
-document.addEventListener('keydown', (ev) => {
-  if (ev.target.matches('input, textarea')) return;
-  const step = ev.shiftKey ? 0.08 : 0.02;
-  const crop = activeCrop();
-  if (ev.key === 'ArrowLeft') crop.ox = clamp(crop.ox - step, -1, 1);
-  else if (ev.key === 'ArrowRight') crop.ox = clamp(crop.ox + step, -1, 1);
-  else if (ev.key === 'ArrowUp') crop.oy = clamp(crop.oy - step, -1, 1);
-  else if (ev.key === 'ArrowDown') crop.oy = clamp(crop.oy + step, -1, 1);
-  else if (ev.key === 'Delete' && state.mode === 'panels') {
-    state.panels[state.selected].photoId = null;
-  } else return;
-  ev.preventDefault();
-  redraw();
-});
-
-// --- Controls -------------------------------------------------------------
-function syncCropControls() {
-  const crop = activeCrop();
-  if (!crop) return;
-  $('zoom').value = crop.zoom;
-  $('offX').value = crop.ox;
-  $('offY').value = crop.oy;
-}
-
-function bindCropSlider(id, key) {
-  $(id).addEventListener('input', () => {
-    activeCrop()[key] = Number($(id).value);
-    redraw();
+function refreshPhotoPick() {
+  const pick = $('photoPick');
+  pick.innerHTML = '';
+  state.photoNames.forEach((name, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = name;
+    pick.appendChild(opt);
   });
-}
-bindCropSlider('zoom', 'zoom');
-bindCropSlider('offX', 'ox');
-bindCropSlider('offY', 'oy');
-
-$('resetCrop').addEventListener('click', () => {
-  Object.assign(activeCrop(), { ox: 0, oy: 0, zoom: 1 });
-  redraw();
-});
-
-$('title').addEventListener('input', () => { state.title = $('title').value; redraw(); });
-$('caption').addEventListener('input', () => { state.caption = $('caption').value; redraw(); });
-
-document.querySelectorAll('input[name="mode"]').forEach((radio) => {
-  radio.addEventListener('change', () => { state.mode = radio.value; redraw(); });
-});
-
-document.querySelectorAll('[data-size]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    state.sizeId = btn.dataset.size;
-    document.querySelectorAll('[data-size]').forEach((b) => b.classList.toggle('on', b === btn));
-    redraw();
-  });
-});
-
-const presetRow = $('presets');
-E.PRESETS.forEach((preset) => {
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'preset' + (preset.id === state.presetId ? ' on' : '');
-  btn.innerHTML = `<span class="chip" style="background:linear-gradient(135deg,${preset.gradeTop},${preset.gradeBottom})"></span>${preset.name}`;
-  btn.addEventListener('click', () => {
-    state.presetId = preset.id;
-    presetRow.querySelectorAll('.preset').forEach((b) => b.classList.toggle('on', b === btn));
-    redraw();
-  });
-  presetRow.appendChild(btn);
-});
-
-// Photo tray: thumbnails of everything loaded; click assigns to the
-// selected panel (or the sliced photo).
-function renderTray() {
-  const tray = $('tray');
-  tray.innerHTML = '';
-  photoList.forEach(({ id, name }) => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'thumb';
-    const img = document.createElement('img');
-    img.src = images.get(id).src;
-    img.alt = name;
-    const label = document.createElement('span');
-    label.textContent = name;
-    btn.append(img, label);
-    btn.addEventListener('click', () => assignToSelected(id));
-    tray.appendChild(btn);
+  const thumbs = $('thumbs');
+  thumbs.innerHTML = '';
+  state.photos.forEach((img, i) => {
+    const t = document.createElement('img');
+    t.src = img.src;
+    t.alt = state.photoNames[i];
+    t.title = state.photoNames[i];
+    t.addEventListener('click', () => {
+      activePlacement().photo = i;
+      syncControls();
+      drawPreview();
+    });
+    thumbs.appendChild(t);
   });
 }
 
-$('fileInput').addEventListener('change', async (ev) => {
-  const files = [...ev.target.files];
+function addPhoto(image, name) {
+  state.photos.push(image);
+  state.photoNames.push(name);
+  ensurePanels();
+  refreshPhotoPick();
+  syncControls();
+  drawPreview();
+}
+
+function loadSample(id) {
+  const sample = SAMPLES.find((s) => s.id === id) || SAMPLES[0];
+  const existing = state.photoNames.indexOf(sample.label);
+  if (existing >= 0) return Promise.resolve(existing);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => { addPhoto(img, sample.label); resolve(state.photos.length - 1); };
+    img.src = sample.src;
+  });
+}
+
+function loadUserFiles(files) {
   for (const file of files) {
-    const id = await addPhotoFile(file);
-    assignToSelected(id);
+    if (!file.type.startsWith('image/')) continue;
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => addPhoto(img, file.name);
+    img.src = url;
   }
-  ev.target.value = '';
-});
+}
 
-SAMPLES.forEach((sample) => {
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'sampleBtn';
-  btn.textContent = `Load sample: ${sample.name}`;
-  btn.addEventListener('click', async () => {
-    const id = await addPhoto(sample.id, sample.name, sample.url);
-    assignToSelected(id);
+// Editor events -------------------------------------------------------------
+
+function bindEditor() {
+  $('titleInput').addEventListener('input', (e) => { state.title = e.target.value; drawPreview(); });
+  $('captionInput').addEventListener('input', (e) => { state.caption = e.target.value; drawPreview(); });
+
+  document.querySelectorAll('[data-preset]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.presetId = btn.dataset.preset;
+      document.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('on', b === btn));
+      drawPreview();
+    });
   });
-  $('samples').appendChild(btn);
-});
 
-$('spread').addEventListener('click', () => {
-  const current = state.mode === 'sliced' ? state.sliced.photoId
-    : state.panels[state.selected].photoId;
-  if (current) { spreadPhoto(current); redraw(); }
-});
+  $('sizePick').addEventListener('change', (e) => {
+    state.sizeId = e.target.value;
+    state.selected = 0;
+    ensurePanels();
+    syncControls();
+    drawPreview();
+  });
 
-// Drag & drop photos anywhere onto the stage.
-const stage = $('stage');
-['dragenter', 'dragover'].forEach((t) => stage.addEventListener(t, (ev) => {
-  ev.preventDefault();
-  stage.classList.add('drop');
-}));
-['dragleave', 'drop'].forEach((t) => stage.addEventListener(t, (ev) => {
-  ev.preventDefault();
-  stage.classList.remove('drop');
-}));
-stage.addEventListener('drop', async (ev) => {
-  const files = [...(ev.dataTransfer?.files || [])].filter((f) => f.type.startsWith('image/'));
-  for (const file of files) {
-    const id = await addPhotoFile(file);
-    assignToSelected(id);
-  }
-});
+  document.querySelectorAll('[data-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.mode = btn.dataset.mode;
+      document.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('on', b === btn));
+      syncControls();
+      drawPreview();
+    });
+  });
 
-// Export: render at the exact pixel size through the same draw function.
-$('exportBtn').addEventListener('click', async () => {
-  await document.fonts.ready;
-  const canvas = E.renderExportCanvas(state, images);
-  canvas.toBlob((blob) => {
+  $('photoPick').addEventListener('change', (e) => {
+    activePlacement().photo = Number(e.target.value);
+    drawPreview();
+  });
+  $('offX').addEventListener('input', (e) => { activePlacement().offX = Number(e.target.value); drawPreview(); });
+  $('offY').addEventListener('input', (e) => { activePlacement().offY = Number(e.target.value); drawPreview(); });
+  $('zoom').addEventListener('input', (e) => { activePlacement().zoom = Number(e.target.value); drawPreview(); });
+
+  $('fileInput').addEventListener('change', (e) => loadUserFiles(e.target.files));
+  document.querySelectorAll('[data-sample]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = await loadSample(btn.dataset.sample);
+      activePlacement().photo = idx;
+      syncControls();
+      drawPreview();
+    });
+  });
+
+  const stage = $('stage');
+  stage.addEventListener('dragover', (e) => { e.preventDefault(); stage.classList.add('drop'); });
+  stage.addEventListener('dragleave', () => stage.classList.remove('drop'));
+  stage.addEventListener('drop', (e) => {
+    e.preventDefault();
+    stage.classList.remove('drop');
+    loadUserFiles(e.dataTransfer.files);
+  });
+
+  // Click a panel to select it; drag on the preview to reposition its photo.
+  let drag = null;
+  preview.addEventListener('pointerdown', (e) => {
+    const rect = preview.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width * preview.width;
+    const y = (e.clientY - rect.top) / rect.height * preview.height;
+    if (state.mode === 'panels') {
+      const polys = panelsForSize(state.sizeId, preview.width, preview.height);
+      const hit = polys.findIndex((poly) => pointInPolygon(x, y, poly));
+      if (hit >= 0) { state.selected = hit; syncControls(); }
+    }
+    drag = { x: e.clientX, y: e.clientY };
+    preview.setPointerCapture(e.pointerId);
+    drawPreview();
+  });
+  preview.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const rect = preview.getBoundingClientRect();
+    const place = activePlacement();
+    place.offX += (e.clientX - drag.x) / rect.width * 0.9;
+    place.offY += (e.clientY - drag.y) / rect.height * 0.9;
+    place.offX = Math.max(-0.6, Math.min(0.6, place.offX));
+    place.offY = Math.max(-0.6, Math.min(0.6, place.offY));
+    drag = { x: e.clientX, y: e.clientY };
+    syncControls();
+    drawPreview();
+  });
+  preview.addEventListener('pointerup', () => { drag = null; });
+
+  $('exportBtn').addEventListener('click', () => {
+    const canvas = renderCoverCanvas(state);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `cover-vice-${canvas.width}x${canvas.height}.png`;
+    a.download = `cover-vice-${state.sizeId}.png`;
+    a.href = canvas.toDataURL('image/png');
     a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    $('status').textContent = `Saved cover-vice-${canvas.width}x${canvas.height}.png`;
-  }, 'image/png');
-});
+  });
+}
 
-// --- Screenshot mode ------------------------------------------------------
+// Shot mode -----------------------------------------------------------------
+// ?shot=cover renders only the finished cover, full viewport, through the
+// export path. ?shot=editor opens the editor with a sample pre-loaded.
+
 async function runShotMode(params) {
-  const shot = params.get('shot');
-  const photoName = params.get('photo') || 'pier';
-  const sample = SAMPLES.find((s) => s.url.endsWith(`${photoName}.jpg`)) || SAMPLES[0];
-  const photoId = await addPhoto(sample.id, sample.name, sample.url);
-
-  if (params.get('size')) state.sizeId = params.get('size');
-  if (params.get('preset')) state.presetId = params.get('preset');
+  document.body.classList.add('shot');
   if (params.get('title')) state.title = params.get('title');
   if (params.get('caption')) state.caption = params.get('caption');
-  $('title').value = state.title;
-  $('caption').value = state.caption;
-  syncPanelCount();
-  spreadPhoto(photoId);
+  if (params.get('preset') && COVER_PRESETS[params.get('preset')]) state.presetId = params.get('preset');
+  if (params.get('size') && COVER_SIZES[params.get('size')]) state.sizeId = params.get('size');
+  await loadSample(params.get('photo') || 'pier');
+  state.sliced.photo = state.photos.length - 1;
+  state.panels.forEach((p) => { p.photo = state.sliced.photo; });
 
-  if (shot === 'cover') {
-    document.body.classList.add('shot-cover');
-    const full = E.renderExportCanvas(state, images);
-    full.id = 'shotCanvas';
-    document.body.appendChild(full);
-  } else {
-    document.body.classList.add('shot-editor');
-    redraw();
+  if (params.get('shot') === 'editor') {
+    document.body.classList.remove('shot');
+    state.caption = params.get('caption') || 'Boulevard queen';
+    $('titleInput').value = state.title;
+    $('captionInput').value = state.caption;
+    bindEditor();
+    syncControls();
+    drawPreview();
+    return;
   }
-  requestAnimationFrame(() => requestAnimationFrame(() => { window.__shotReady = true; }));
+  $('app').style.display = 'none';
+  const canvas = renderCoverCanvas(state);
+  canvas.id = 'shotCanvas';
+  document.body.appendChild(canvas);
 }
 
-// --- Boot -----------------------------------------------------------------
-(async function boot() {
-  syncPanelCount();
-  await document.fonts.load('100px Anton');
-  await document.fonts.ready;
+async function boot() {
+  try {
+    await document.fonts.load('80px "Anton"');
+    await document.fonts.ready;
+  } catch { /* fallback fonts still draw */ }
   const params = new URLSearchParams(location.search);
+  ensurePanels();
   if (params.get('shot')) {
     await runShotMode(params);
-  } else {
-    // Friendly first paint: the pier sample spread across the panels.
-    const id = await addPhoto(SAMPLES[0].id, SAMPLES[0].name, SAMPLES[0].url);
-    spreadPhoto(id);
-    redraw();
+    return;
   }
-})();
+  bindEditor();
+  await loadSample('pier');
+  await loadSample('boulevard');
+  state.sliced.photo = 0;
+  syncControls();
+  drawPreview();
+}
+
+boot();
